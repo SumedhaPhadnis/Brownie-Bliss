@@ -31,6 +31,7 @@ async function loadProducts() {
                 category: p.category,
                 price: p.price,
                 emoji: p.emoji,
+                stock: p.stock,
                 img: p.img
             }));
 
@@ -105,6 +106,10 @@ function updateCartUI() {
 }
 
 function addToCart(product) {
+    if (product.stock === 0) {
+    showToast('This item is sold out ');
+    return;
+}
     const existing = cart.find(i => i.name === product.name && i.message === product.message);
     if (existing) {
         existing.qty++;
@@ -469,9 +474,20 @@ function filterProducts(category, btn) {
                 <div class="product-category">${p.category}</div>
                 <div class="product-name">${p.name}</div>
                 <div class="product-price">₹${p.price}</div>
-                <button class="add-to-cart" onclick='addToCart(${JSON.stringify(p)})'>
-                    Add to Cart
-                </button>
+                <div class="stock-status ${
+                 p.stock === 0
+                 ? 'sold-out'
+                 : p.stock <= 3
+                 ? 'low-stock'
+                 : 'available'}">${
+                p.stock === 0
+                ? 'Sold Out'
+                : p.stock <= 3
+                ? 'Low Stock'
+                : 'Available'}</div>
+                <button class="add-to-cart" ${p.stock === 0 ? 'disabled' : ''}
+                onclick='addToCart(${JSON.stringify(p)})'>
+               ${p.stock === 0 ? 'Sold Out' : 'Add to Cart'}</button>
             </div>
         </div>
     `).join('');
