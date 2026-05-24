@@ -4,9 +4,15 @@ const cors = require('cors');
 const path = require('path');
 const axios = require('axios');
 const jwt = require('jsonwebtoken');
+const helmet = require('helmet');
+const bcrypt = require('bcryptjs');
 require('dotenv').config();
 const serverless = require('serverless-http');
 const adminAuth = require('../middlewares/adminAuth');
+
+const Order = require('../models/Order');
+const Otp = require('../models/Otp');
+const Product = require('../models/Product');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -21,14 +27,40 @@ const ADMIN_JWT_EXPIRES_IN = process.env.ADMIN_JWT_EXPIRES_IN || '2h';
 // Disable buffering so mongoose throws immediately if not connected
 mongoose.set('bufferCommands', false);
 
-app.use(cors());
-app.use(express.json());
+// Security Enhancements
+app.use(helmet());
+
+// Restrict CORS origins dynamically
+const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173'
+];
+app.use(cors({
+  origin: function(origin, callback) {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1 || allowedOrigins.includes('*')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  credentials: true
+}));
+
+// Apply request body size limit
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, '../public')));
 
 // ─── CACHED SERVERLESS CONNECTION ──────────────────────────────────────────────
 let isConnected = false;
 
 async function connectDB() {
+  if (process.env.NODE_ENV === 'test') {
+    isConnected = true;
+    return;
+  }
   if (isConnected && mongoose.connection.readyState === 1) return;
 
   if (!MONGO_URI) {
@@ -61,55 +93,6 @@ app.use(async (req, res, next) => {
   }
 });
 
-// ─── SCHEMAS ───────────────────────────────────────────────────────────────────
-const orderItemSchema = new mongoose.Schema({
-  id: { type: Number },
-  name: { type: String, required: true },
-  price: { type: Number, required: true },
-  qty: { type: Number, required: true },
-  emoji: { type: String, default: '🍫' },
-  category: { type: String },
-}, { _id: false });
-
-const orderSchema = new mongoose.Schema({
-  order_id: { type: String, unique: true, required: true },
-  customer_name: { type: String, required: true },
-  phone: { type: String, required: true },
-  address: { type: String, required: true },
-  city: { type: String, required: true },
-  pincode: { type: String, required: true },
-  items: { type: [orderItemSchema], required: true },
-  total: { type: Number, required: true },
-  status: { type: String, enum: ['pending', 'confirmed', 'preparing', 'delivered', 'cancelled'], default: 'pending' },
-  payment_status: { type: String, enum: ['unpaid', 'paid'], default: 'unpaid' },
-  notes: { type: String, default: '' },
-  confirmed_at: { type: Date, default: null },
-}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
-
-const otpSchema = new mongoose.Schema({
-  phone: { type: String, required: true },
-  otp: { type: String, required: true },
-  expires_at: { type: Date, required: true },
-  used: { type: Boolean, default: false },
-}, { timestamps: { createdAt: 'created_at' } });
-
-// Auto-delete OTP documents after they expire (TTL index)
-otpSchema.index({ expires_at: 1 }, { expireAfterSeconds: 0 });
-
-const productSchema = new mongoose.Schema({
-  type: { type: String, enum: ['standard', 'birthday'], required: true },
-  id_ref: { type: mongoose.Schema.Types.Mixed }, // String or Number for reference
-  name: { type: String, required: true },
-  category: { type: String },
-  price: { type: Number, required: true },
-  emoji: { type: String },
-  img: { type: String }
-});
-
-const Order = mongoose.model('Order', orderSchema);
-const Otp = mongoose.model('Otp', otpSchema);
-const Product = mongoose.model('Product', productSchema);
-
 // ─── INIT PRODUCTS ─────────────────────────────────────────────────────────────
 async function seedProducts() {
   const count = await Product.countDocuments();
@@ -138,7 +121,6 @@ async function seedProducts() {
     console.log('🌱 Seeded initial products to database');
   }
 }
-// seedProducts();
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────────
 function generateOrderId() {
@@ -151,8 +133,6 @@ function generateOrderId() {
 function generateOTP() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
-//─────────────────────JWT BASED AUTHENTICATION───────────────────────────────────────────
-
 
 // ─── ADMIN AUTH ROUTES ─────────────────────────────────────────────────────────
 app.post('/api/admin/login', (req, res) => {
@@ -166,7 +146,13 @@ app.post('/api/admin/login', (req, res) => {
     return res.status(400).json({ success: false, message: 'Username and password are required' });
   }
 
-  if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
+  // Support secure bcrypt password hashes or plain-text fallback (non-breaking)
+  const isBcrypt = ADMIN_PASSWORD.startsWith('$2a$') || ADMIN_PASSWORD.startsWith('$2b$');
+  const passwordMatch = isBcrypt 
+    ? bcrypt.compareSync(password, ADMIN_PASSWORD) 
+    : password === ADMIN_PASSWORD;
+
+  if (username !== ADMIN_USERNAME || !passwordMatch) {
     return res.status(401).json({ success: false, message: 'Invalid credentials' });
   }
 
@@ -180,7 +166,6 @@ app.post('/api/admin/login', (req, res) => {
 });
 
 // ─── OTP ROUTES ────────────────────────────────────────────────────────────────
-// Send OTP  (demo — shows OTP in response; in production wire up MSG91 / Twilio)
 app.post('/api/send-otp', async (req, res) => {
   try {
     const { phone } = req.body;
@@ -213,10 +198,12 @@ app.post('/api/send-otp', async (req, res) => {
         console.log(`✅ SMS sent to ${phone}`);
       } catch (smsErr) {
         console.error('❌ Fast2SMS Error:', smsErr.response ? smsErr.response.data : smsErr.message);
-        // We continue anyway so the user can use the console log in dev if needed
       }
     } else {
-      console.log(`📱 [DEMO MODE] OTP for ${phone}: ${otp}`);
+      // Gate OTP console log in non-development environments
+      if (process.env.NODE_ENV === 'development' || process.env.ENABLE_OTP_LOG === 'true') {
+        console.log(`📱 [DEMO MODE] OTP for ${phone}: ${otp}`);
+      }
     }
 
     res.json({
@@ -256,7 +243,6 @@ app.post('/api/verify-otp', async (req, res) => {
 });
 
 // ─── PRODUCT ROUTES ────────────────────────────────────────────────────────────
-// Get all products
 app.get('/api/products', async (req, res) => {
   try {
     const products = await Product.find().lean();
@@ -267,7 +253,6 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
-// Add new product
 app.post('/api/products', adminAuth, async (req, res) => {
   try {
     const { type, name, category, price, emoji, img } = req.body;
@@ -301,12 +286,10 @@ app.post('/api/products', adminAuth, async (req, res) => {
   }
 });
 
-// Update product details
 app.patch('/api/products/:id', adminAuth, async (req, res) => {
   try {
     const { price, name, img } = req.body;
 
-    // Build update object dynamically
     const updateData = {};
     if (price !== undefined && !isNaN(price) && price >= 0) {
       updateData.price = Number(price);
@@ -314,7 +297,7 @@ app.patch('/api/products/:id', adminAuth, async (req, res) => {
     if (name !== undefined && name.trim() !== '') {
       updateData.name = name.trim();
     }
-    if (img !== undefined) { // Allow empty string to clear image if desired
+    if (img !== undefined) {
       updateData.img = img.trim();
     }
 
@@ -339,7 +322,6 @@ app.patch('/api/products/:id', adminAuth, async (req, res) => {
   }
 });
 
-// Delete product
 app.delete('/api/products/:id', adminAuth, async (req, res) => {
   try {
     const product = await Product.findByIdAndDelete(req.params.id);
@@ -354,7 +336,6 @@ app.delete('/api/products/:id', adminAuth, async (req, res) => {
 });
 
 // ─── ORDER ROUTES ──────────────────────────────────────────────────────────────
-// Create order
 app.post('/api/orders', async (req, res) => {
   try {
     const { customer_name, phone, address, city, pincode, items, total } = req.body;
@@ -383,7 +364,6 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// Get all orders (admin)
 app.get('/api/orders', adminAuth, async (req, res) => {
   try {
     const { status } = req.query;
@@ -401,7 +381,6 @@ app.get('/api/orders', adminAuth, async (req, res) => {
   }
 });
 
-// Get single order
 app.get('/api/orders/:orderId', async (req, res) => {
   try {
     const order = await Order.findOne({ order_id: req.params.orderId }).lean();
@@ -412,7 +391,6 @@ app.get('/api/orders/:orderId', async (req, res) => {
   }
 });
 
-// Confirm payment (admin action)
 app.patch('/api/orders/:orderId/confirm-payment', adminAuth, async (req, res) => {
   try {
     const { notes } = req.body;
@@ -433,7 +411,6 @@ app.patch('/api/orders/:orderId/confirm-payment', adminAuth, async (req, res) =>
   }
 });
 
-// Update order status
 app.patch('/api/orders/:orderId/status', adminAuth, async (req, res) => {
   try {
     const { status } = req.body;
@@ -449,7 +426,6 @@ app.patch('/api/orders/:orderId/status', adminAuth, async (req, res) => {
   }
 });
 
-// Stats for admin dashboard
 app.get('/api/stats', adminAuth, async (req, res) => {
   try {
     const [totalOrders, pendingOrders, paidOrders, revenueResult] = await Promise.all([
@@ -490,3 +466,4 @@ if (require.main === module) {
 }
 
 module.exports = serverless(app);
+module.exports.app = app; // Export app for integration tests
